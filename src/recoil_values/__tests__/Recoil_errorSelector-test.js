@@ -10,20 +10,30 @@
  */
 'use strict';
 
-const errorSelector = require('../Recoil_error');
-const {getRecoilValueAsLoadable} = require('../../core/Recoil_RecoilValue');
-const {makeStore} = require('../../testing/Recoil_TestingUtils');
+const {getRecoilTestFn} = require('../../testing/Recoil_TestingUtils');
 
-let store;
-beforeEach(() => {
+let store, getRecoilValueAsLoadable, errorSelector;
+
+const testRecoil = getRecoilTestFn(() => {
+  const {makeStore} = require('../../testing/Recoil_TestingUtils');
+
+  ({
+    getRecoilValueAsLoadable,
+  } = require('../../core/Recoil_RecoilValueInterface'));
+  errorSelector = require('../Recoil_errorSelector');
+
   store = makeStore();
 });
 
-function getError(recoilValue) {
-  return getRecoilValueAsLoadable(store, recoilValue).errorOrThrow();
+function getError(recoilValue): Error {
+  const error = getRecoilValueAsLoadable(store, recoilValue).errorOrThrow();
+  if (!(error instanceof Error)) {
+    throw new Error('Expected error to be an instance of Error');
+  }
+  return error;
 }
 
-test('errorSelector - string', () => {
+testRecoil('errorSelector - string', () => {
   const mySelector = errorSelector('My Error');
   expect(getError(mySelector).message).toEqual(
     expect.stringContaining('My Error'),

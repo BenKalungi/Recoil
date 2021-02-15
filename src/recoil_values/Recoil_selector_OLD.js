@@ -53,58 +53,66 @@
  */
 'use strict';
 
-import type {CacheImplementation} from '../caches/Recoil_Cache';
 import type {Loadable} from '../adt/Recoil_Loadable';
+import type {CacheImplementation} from '../caches/Recoil_Cache';
+import type {DependencyMap} from '../core/Recoil_Graph';
 import type {DefaultValue} from '../core/Recoil_Node';
 import type {
   RecoilState,
   RecoilValue,
   RecoilValueReadOnly,
 } from '../core/Recoil_RecoilValue';
-import type {NodeKey, Store, TreeState} from '../core/Recoil_State';
+import type {RetainedBy} from '../core/Recoil_RetainedBy';
+import type {AtomWrites, NodeKey, Store, TreeState} from '../core/Recoil_State';
 
-const cacheWithReferenceEquality = require('../caches/Recoil_cacheWithReferenceEquality');
-const {
-  mapBySettingInMap,
-  mapByUpdatingInMap,
-  setByAddingToSet,
-  setByDeletingFromSet,
-} = require('../util/Recoil_CopyOnWrite');
-const deepFreezeValue = require('../util/Recoil_deepFreezeValue');
-const {
-  detectCircularDependencies,
-  getNodeLoadable,
-  setNodeValue,
-} = require('../core/Recoil_FunctionalCore');
 const {
   loadableWithError,
   loadableWithPromise,
   loadableWithValue,
 } = require('../adt/Recoil_Loadable');
+const cacheWithReferenceEquality = require('../caches/Recoil_cacheWithReferenceEquality');
+const {
+  getNodeLoadable,
+  peekNodeLoadable,
+  setNodeValue,
+} = require('../core/Recoil_FunctionalCore');
+const {
+  addToDependencyMap,
+  mergeDepsIntoDependencyMap,
+  saveDependencyMapToStore,
+} = require('../core/Recoil_Graph');
 const {
   DEFAULT_VALUE,
   RecoilValueNotReady,
+  getConfigDeletionHandler,
   registerNode,
 } = require('../core/Recoil_Node');
-const {startPerfBlock} = require('../util/Recoil_PerformanceTimings');
-const {isRecoilValue} = require('../core/Recoil_RecoilValue');
-
-const differenceSets = require('../util/Recoil_differenceSets');
-const equalsSet = require('../util/Recoil_equalsSet');
+const {AbstractRecoilValue} = require('../core/Recoil_RecoilValue');
+const {
+  getRecoilValueAsLoadable,
+  isRecoilValue,
+  setRecoilValueLoadable,
+} = require('../core/Recoil_RecoilValueInterface');
+const {retainedByOptionWithDefault} = require('../core/Recoil_Retention');
+const deepFreezeValue = require('../util/Recoil_deepFreezeValue');
+const gkx = require('../util/Recoil_gkx');
 const isPromise = require('../util/Recoil_isPromise');
 const nullthrows = require('../util/Recoil_nullthrows');
+const {startPerfBlock} = require('../util/Recoil_PerformanceTimings');
 
+export type ValueOrUpdater<T> =
+  | T
+  | DefaultValue
+  | ((prevValue: T) => T | DefaultValue);
 export type GetRecoilValue = <T>(RecoilValue<T>) => T;
-export type SetRecoilState = <T>(
-  RecoilState<T>,
-  T | DefaultValue | ((prevValue: T) => T | DefaultValue),
-) => void;
+export type SetRecoilState = <T>(RecoilState<T>, ValueOrUpdater<T>) => void;
 export type ResetRecoilState = <T>(RecoilState<T>) => void;
 
 type ReadOnlySelectorOptions<T> = $ReadOnly<{
   key: string,
   get: ({get: GetRecoilValue}) => Promise<T> | RecoilValue<T> | T,
 
+  retainedBy_UNSTABLE?: RetainedBy,
   cacheImplementation_UNSTABLE?: CacheImplementation<Loadable<T>>,
   dangerouslyAllowMutability?: boolean,
 }>;
@@ -129,10 +137,15 @@ function cacheKeyFromDepValues(depValues: DepValues): CacheKey {
   for (const key of Array.from(depValues.keys()).sort()) {
     const loadable = nullthrows(depValues.get(key));
     answer.push(key);
+    answer.push(loadable.state);
     answer.push(loadable.contents);
   }
   return answer;
 }
+
+const dependencyStack = []; // for detecting circular dependencies.
+
+const waitingStores: Map<Loadable<mixed>, Set<Store>> = new Map();
 
 /* eslint-disable no-redeclare */
 declare function selector<T>(
@@ -151,15 +164,63 @@ function selector<T>(
   let cache: CacheImplementation<Loadable<T>> =
     cacheImplementation ?? cacheWithReferenceEquality();
 
-  function putIntoCache(
+  const retainedBy = retainedByOptionWithDefault(options.retainedBy_UNSTABLE);
+  let liveStoresCount = 0;
+
+  function selectorIsLive() {
+    return !gkx('recoil_memory_managament_2020') || liveStoresCount > 0;
+  }
+
+  function selectorInit(store: Store) {
+    liveStoresCount++;
+    store.getState().knownSelectors.add(key); // FIXME remove knownSelectors?
+    return () => {
+      liveStoresCount--;
+      store.getState().knownSelectors.delete(key);
+    };
+  }
+
+  function letStoreBeNotifiedWhenAsyncSettles(
     store: Store,
+    loadable: Loadable<T>,
+  ): void {
+    if (loadable.state === 'loading') {
+      let stores = waitingStores.get(loadable);
+      if (stores === undefined) {
+        waitingStores.set(loadable, (stores = new Set()));
+      }
+      stores.add(store);
+    }
+  }
+
+  function notifyStoresOfSettledAsync(
+    originalLoadable: Loadable<T>,
+    newLoadable: Loadable<T>,
+  ): void {
+    const stores = waitingStores.get(originalLoadable);
+    if (stores !== undefined) {
+      for (const store of stores) {
+        setRecoilValueLoadable(
+          store,
+          new AbstractRecoilValue(key),
+          newLoadable,
+        );
+      }
+      waitingStores.delete(originalLoadable);
+    }
+  }
+
+  function putIntoCache(
+    state: TreeState,
     cacheKey: CacheKey,
     loadable: Loadable<T>,
   ) {
     if (loadable.state !== 'loading') {
       // Synchronous result
-      if (!options.dangerouslyAllowMutability === true) {
-        deepFreezeValue(loadable.contents);
+      if (__DEV__) {
+        if (!options.dangerouslyAllowMutability === true) {
+          deepFreezeValue(loadable.contents);
+        }
       }
     } else {
       // Asynchronous result
@@ -167,11 +228,18 @@ function selector<T>(
       // cache and fire any external subscriptions to re-render with the new value.
       loadable.contents
         .then((result: $FlowFixMe) => {
-          // If the value is now resolved, then update the cache with the new value
-          if (!options.dangerouslyAllowMutability === true) {
-            deepFreezeValue(result);
+          if (!selectorIsLive()) {
+            return; // The selector was released since the request began.
           }
-          cache = cache.set(cacheKey, loadableWithValue(result));
+          if (__DEV__) {
+            if (!options.dangerouslyAllowMutability === true) {
+              deepFreezeValue(result);
+            }
+          }
+          const newLoadable = loadableWithValue(result);
+
+          // If the value is now resolved, then update the cache with the new value
+          cache = cache.set(cacheKey, newLoadable);
 
           // TODO Potential optimization: I think this is updating the cache
           // with a cacheKey of the dep when it wasn't ready yet.  We could also
@@ -190,47 +258,56 @@ function selector<T>(
           // Fire subscriptions to re-render any subscribed components with the new value.
           // The store uses the CURRENT state, not the old state from which
           // this was called.  That state likely doesn't have the subscriptions saved yet.
-          store.fireNodeSubscriptions(new Set([key]), 'now');
+          // Note that we have to set the value for this key, not just notify
+          // components, so that there will be a new version for useMutableSource.
+          notifyStoresOfSettledAsync(loadable, newLoadable);
           return result;
         })
         .catch(error => {
-          // TODO Figure out why we are catching promises here versus evaluateSelectorFunction
-          // OH, I see why.  Ok, work on this.
           if (isPromise(error)) {
             return error;
           }
+          if (!selectorIsLive()) {
+            return; // The selector was released since the request began.
+          }
+          if (__DEV__) {
+            if (!options.dangerouslyAllowMutability === true) {
+              deepFreezeValue(error);
+            }
+          }
           // The async value was rejected with an error.  Update the cache with
           // the error and fire subscriptions to re-render.
-          if (!options.dangerouslyAllowMutability === true) {
-            deepFreezeValue(error);
-          }
-          cache = cache.set(cacheKey, loadableWithError(error));
-          store.fireNodeSubscriptions(new Set([key]), 'now');
+          const newLoadable = loadableWithError(error);
+          cache = cache.set(cacheKey, newLoadable);
+          notifyStoresOfSettledAsync(loadable, newLoadable);
           return error;
         });
     }
 
     cache = cache.set(cacheKey, loadable);
+    if (loadable.state !== 'loading') {
+      state.atomValues.set(key, loadable);
+    }
   }
 
-  function getFromCache(
+  function getFromCacheOrEvaluate(
     store: Store,
     state: TreeState,
-  ): [TreeState, Loadable<T>] {
-    let newState = state;
+  ): [DependencyMap, Loadable<T>] {
+    const dependencyMap: DependencyMap = new Map();
 
     // First, get the current deps for this selector
-    const currentDeps = state.nodeDeps.get(key) ?? emptySet;
+    const currentDeps =
+      store.getGraph(state.version).nodeDeps.get(key) ?? emptySet;
+
     const depValues: DepValues = new Map(
       Array.from(currentDeps)
         .sort()
         .map(depKey => {
-          const [nextState, loadable] = getNodeLoadable(
-            store,
-            newState,
-            depKey,
-          );
-          newState = nextState;
+          const [deps, loadable] = getNodeLoadable(store, state, depKey);
+          mergeDepsIntoDependencyMap(deps, dependencyMap);
+          saveDependencyMapToStore(dependencyMap, store, state.version);
+
           return [depKey, loadable];
         }),
     );
@@ -241,34 +318,40 @@ function selector<T>(
     const cached: Loadable<T> | void = cache.get(cacheKey);
 
     if (cached != null) {
-      return [newState, cached];
+      letStoreBeNotifiedWhenAsyncSettles(store, cached);
+      return [dependencyMap, cached];
     }
 
     // Cache miss, compute the value
-    const [nextState, loadable, newDepValues] = computeAndSubscribeSelector(
+    const [deps, loadable, newDepValues] = evaluateSelectorFunction(
       store,
-      newState,
+      state,
     );
-    newState = nextState;
+
+    mergeDepsIntoDependencyMap(deps, dependencyMap);
+    saveDependencyMapToStore(dependencyMap, store, state.version);
 
     // Save result in cache
     const newCacheKey = cacheKeyFromDepValues(newDepValues);
-    putIntoCache(store, newCacheKey, loadable);
-    return [newState, loadable];
+    letStoreBeNotifiedWhenAsyncSettles(store, loadable);
+    putIntoCache(state, newCacheKey, loadable);
+    return [dependencyMap, loadable];
   }
 
   function evaluateSelectorFunction(
     store: Store,
     state: TreeState,
-  ): [TreeState, Loadable<T>, DepValues] {
+  ): [DependencyMap, Loadable<T>, DepValues] {
     const endPerfBlock = startPerfBlock(key);
-    let newState = state;
-    const depValues = new Map();
+    const depValues = new Map(); // key -> value for our deps
+    const dependencyMap: DependencyMap = new Map(); // node -> nodes, part of overall dep map.
 
-    function getRecoilValue<S>({key}: RecoilValue<S>): S {
-      let loadable: Loadable<S>;
-      [newState, loadable] = getNodeLoadable(store, state, key);
-      depValues.set(key, loadable);
+    function getRecoilValue<S>({key: depKey}: RecoilValue<S>): S {
+      addToDependencyMap(key, depKey, dependencyMap);
+      const [deps, loadable] = getNodeLoadable(store, state, depKey);
+      depValues.set(depKey, loadable);
+      mergeDepsIntoDependencyMap(deps, dependencyMap);
+      saveDependencyMapToStore(dependencyMap, store, state.version);
       if (loadable.state === 'hasValue') {
         return loadable.contents;
       } else {
@@ -279,120 +362,140 @@ function selector<T>(
     try {
       // The big moment!
       const output = get({get: getRecoilValue});
-
-      const result = isRecoilValue(output) ? getRecoilValue(output) : output;
-
       // TODO Allow user to also return Loadables for improved composability
-
-      const loadable: Loadable<T> = !isPromise(result)
-        ? // The selector returned a simple synchronous value, so let's use it!
-          (endPerfBlock(), loadableWithValue<T>(result))
-        : // The user returned a promise for an asynchronous selector.  This will
-          // resolve to the proper value of the selector when available.
-          loadableWithPromise<T>((result: $FlowFixMe).finally(endPerfBlock));
-      return [newState, loadable, depValues];
+      const result = isRecoilValue(output) ? getRecoilValue(output) : output;
+      let loadable: Loadable<T>;
+      if (!isPromise(result)) {
+        // The selector returned a simple synchronous value, so let's use it!
+        endPerfBlock();
+        loadable = loadableWithValue<T>(result);
+      } else {
+        // The user returned a promise for an asynchronous selector.  This will
+        // resolve to the proper value of the selector when available.
+        loadable = loadableWithPromise<T>(
+          (result: $FlowFixMe).finally(endPerfBlock),
+        );
+      }
+      return [dependencyMap, loadable, depValues];
     } catch (errorOrDepPromise) {
-      const loadable = !isPromise(errorOrDepPromise)
-        ? // There was a synchronous error in the evaluation
-          (endPerfBlock(), loadableWithError(errorOrDepPromise))
-        : // If an asynchronous dependency was not ready, then return a promise that
-          // will resolve when we finally do have a real value or error for the selector.
-          loadableWithPromise(
-            errorOrDepPromise
-              .then(() => {
-                // The dependency we were waiting on is now available.
-                // So, let's try to evaluate the selector again and return that value.
-                let loadable = loadableWithError(
-                  new Error('Internal Recoil Selector Error'), // To make Flow happy
-                );
-                // This is done asynchronously, so we need to make sure to save the state
-                store.replaceState(asyncState => {
-                  let newAsyncState;
-                  [newAsyncState, loadable] = getFromCache(store, asyncState);
-                  return newAsyncState;
-                });
-
-                if (loadable.state === 'hasError') {
-                  throw loadable.contents;
-                }
-                // Either the re-try provided a value, which we will use, or it
-                // got blocked again.  In that case this is a promise and we'll try again.
-                return loadable.contents;
-              })
-              .finally(endPerfBlock),
-          );
-
-      return [newState, loadable, depValues];
+      // XXX why was this changed to not use isPromise?
+      const isP = errorOrDepPromise.then !== undefined;
+      let loadable: Loadable<T>;
+      if (!isP) {
+        // There was a synchronous error in the evaluation
+        endPerfBlock();
+        loadable = loadableWithError(errorOrDepPromise);
+      } else {
+        // If an asynchronous dependency was not ready, then return a promise that
+        // will resolve when we finally do have a real value or error for the selector.
+        loadable = loadableWithPromise(
+          errorOrDepPromise
+            .then(() => {
+              // Now that its deps are ready, re-evaluate the selector (and
+              // record any newly-discovered dependencies in the Store):
+              const loadable = getRecoilValueAsLoadable(
+                store,
+                new AbstractRecoilValue(key),
+              );
+              if (loadable.state === 'hasError') {
+                throw loadable.contents;
+              }
+              // Either the re-try provided a value, which we will use, or it
+              // got blocked again.  In that case this is a promise and we'll try again.
+              return loadable.contents;
+            })
+            .finally(endPerfBlock),
+        );
+      }
+      return [dependencyMap, loadable, depValues];
     }
   }
 
-  function computeAndSubscribeSelector(
+  function detectCircularDependencies(fn) {
+    if (dependencyStack.includes(key)) {
+      const message = `Recoil selector has circular dependencies: ${dependencyStack
+        .slice(dependencyStack.indexOf(key))
+        .join(' \u2192 ')}`;
+      return [new Map(), loadableWithError(new Error(message))];
+    }
+    dependencyStack.push(key);
+    try {
+      return fn();
+    } finally {
+      dependencyStack.pop();
+    }
+  }
+
+  function selectorPeek(store: Store, state: TreeState): ?Loadable<T> {
+    // First, get the current deps for this selector
+    const currentDeps =
+      store.getGraph(state.version).nodeDeps.get(key) ?? emptySet;
+    const depValues: Map<NodeKey, ?Loadable<mixed>> = new Map(
+      Array.from(currentDeps)
+        .sort()
+        .map(depKey => [depKey, peekNodeLoadable(store, state, depKey)]),
+    );
+
+    const cacheDepValues = new Map();
+    for (const [depKey, depValue] of depValues.entries()) {
+      if (depValue == null) {
+        return undefined;
+      }
+      cacheDepValues.set(depKey, depValue);
+    }
+
+    // Always cache and evaluate a selector
+    // It may provide a result even when not all deps are available.
+    const cacheKey = cacheKeyFromDepValues(cacheDepValues);
+    return cache.get(cacheKey);
+  }
+
+  function selectorInvalidate(state: TreeState) {
+    state.atomValues.delete(key);
+  }
+
+  function selectorGet(
     store: Store,
     state: TreeState,
-  ): [TreeState, Loadable<T>, DepValues] {
-    // Call the selector get evaluation function to get the new value
-    const [
-      newStateFromEvaluate,
-      loadable,
-      newDepValues,
-    ] = evaluateSelectorFunction(store, state);
-    let newState = newStateFromEvaluate;
-
-    // Update state with new upsteram dependencies
-    const oldDeps = state.nodeDeps.get(key) ?? emptySet;
-    const newDeps = new Set(newDepValues.keys());
-    newState = equalsSet(oldDeps, newDeps)
-      ? newState
-      : {
-          ...newState,
-          nodeDeps: mapBySettingInMap(newState.nodeDeps, key, newDeps),
-        };
-
-    // Update state with new downstream subscriptions
-    const addedDeps = differenceSets(newDeps, oldDeps);
-    const removedDeps = differenceSets(oldDeps, newDeps);
-    for (const upstreamNode of addedDeps) {
-      newState = {
-        ...newState,
-        nodeToNodeSubscriptions: mapByUpdatingInMap(
-          newState.nodeToNodeSubscriptions,
-          upstreamNode,
-          subs => setByAddingToSet(subs ?? emptySet, key),
-        ),
-      };
-    }
-    for (const upstreamNode of removedDeps) {
-      newState = {
-        ...newState,
-        nodeToNodeSubscriptions: mapByUpdatingInMap(
-          newState.nodeToNodeSubscriptions,
-          upstreamNode,
-          subs => setByDeletingFromSet(subs ?? emptySet, key),
-        ),
-      };
+  ): [DependencyMap, Loadable<T>] {
+    // First-level cache: Have we already evaluated the selector since being
+    // invalidated due to a dependency changing?
+    const cached = state.atomValues.get(key);
+    if (cached !== undefined) {
+      return [new Map(), cached];
     }
 
+    // Second-level cache based on looking up current dependencies in a map
+    // and evaluating selector if missing.
     if (__DEV__) {
-      detectCircularDependencies(newState, [key]);
+      return detectCircularDependencies(() =>
+        getFromCacheOrEvaluate(store, state),
+      );
+    } else {
+      return getFromCacheOrEvaluate(store, state);
     }
-    return [newState, loadable, newDepValues];
   }
 
-  function myGet(store: Store, state: TreeState): [TreeState, Loadable<T>] {
-    // TODO memoize a value if no deps have changed to avoid a cache lookup
-    // Lookup the node value in the cache.  If not there, then compute
-    // the value and update the state with any changed node subscriptions.
-    return getFromCache(store, state);
+  function selectorShouldDeleteConfigOnRelease() {
+    return getConfigDeletionHandler(key) !== undefined && !selectorIsLive();
   }
 
   if (set != null) {
-    function mySet(store, state, newValue) {
-      let newState = state;
-      const writtenNodes: Set<NodeKey> = new Set();
+    function selectorSet(store, state, newValue): [DependencyMap, AtomWrites] {
+      let syncSelectorSetFinished = false;
+      const dependencyMap: DependencyMap = new Map();
+      const writes: AtomWrites = new Map();
 
       function getRecoilValue<S>({key}: RecoilValue<S>): S {
-        const [nextState, loadable] = getNodeLoadable(store, newState, key);
-        newState = nextState;
+        if (syncSelectorSetFinished) {
+          throw new Error(
+            'Recoil: Async selector sets are not currently supported.',
+          );
+        }
+
+        const [deps, loadable] = getNodeLoadable(store, state, key);
+        mergeDepsIntoDependencyMap(deps, dependencyMap);
+
         if (loadable.state === 'hasValue') {
           return loadable.contents;
         } else if (loadable.state === 'loading') {
@@ -406,43 +509,73 @@ function selector<T>(
         recoilState: RecoilState<S>,
         valueOrUpdater: S | DefaultValue | ((S, GetRecoilValue) => S),
       ) {
+        if (syncSelectorSetFinished) {
+          throw new Error(
+            'Recoil: Async selector sets are not currently supported.',
+          );
+        }
+
         const newValue =
           typeof valueOrUpdater === 'function'
             ? // cast to any because we can't restrict type S from being a function itself without losing support for opaque types
               // flowlint-next-line unclear-type:off
               (valueOrUpdater: any)(getRecoilValue(recoilState))
             : valueOrUpdater;
-        let written: $ReadOnlySet<NodeKey>;
-        [newState, written] = setNodeValue(
+        const [deps, upstreamWrites] = setNodeValue(
           store,
-          newState,
+          state,
           recoilState.key,
           newValue,
         );
-        written.forEach(atom => writtenNodes.add(atom));
+        mergeDepsIntoDependencyMap(deps, dependencyMap);
+
+        upstreamWrites.forEach((v, k) => writes.set(k, v));
       }
 
       function resetRecoilState<S>(recoilState: RecoilState<S>) {
         setRecoilState(recoilState, DEFAULT_VALUE);
       }
 
-      set(
+      const ret = set(
         {set: setRecoilState, get: getRecoilValue, reset: resetRecoilState},
         newValue,
       );
-      return [newState, writtenNodes];
+
+      // set should be a void method, but if the user makes it `async`, then it
+      // will return a Promise, which we don't currently support.
+      if (ret !== undefined) {
+        throw isPromise(ret)
+          ? new Error(
+              'Recoil: Async selector sets are not currently supported.',
+            )
+          : new Error('Recoil: selector set should be a void function.');
+      }
+      syncSelectorSetFinished = true;
+      return [dependencyMap, writes];
     }
     return registerNode<T>({
       key,
-      options,
-      get: myGet,
-      set: mySet,
+      peek: selectorPeek,
+      get: selectorGet,
+      set: selectorSet,
+      invalidate: selectorInvalidate,
+      init: selectorInit,
+      shouldDeleteConfigOnRelease: selectorShouldDeleteConfigOnRelease,
+      dangerouslyAllowMutability: options.dangerouslyAllowMutability,
+      shouldRestoreFromSnapshots: false,
+      retainedBy,
     });
   } else {
     return registerNode<T>({
       key,
-      options,
-      get: myGet,
+      peek: selectorPeek,
+      get: selectorGet,
+      invalidate: selectorInvalidate,
+      init: selectorInit,
+      shouldDeleteConfigOnRelease: selectorShouldDeleteConfigOnRelease,
+      dangerouslyAllowMutability: options.dangerouslyAllowMutability,
+      shouldRestoreFromSnapshots: false,
+      retainedBy,
     });
   }
 }

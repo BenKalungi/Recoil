@@ -1,5 +1,70 @@
 # Change Log
 
+## NEXT
+
+- Performance optimization to suppress re-rendering components:
+    - When subscribed selectors evaluate to the same value. (#749)
+    - On initial render when not using React Concurrent Mode (#820)
+- Added useGetRecoilValueInfo_UNSTABLE() hook for dev tools. (#713, #714)
+- Bug Fix: Ensuring that throwing non Error (and non Promise) objects is supported and puts the selector into a hasError state
+- Changed semantics of waitForAny() such that it will always return loadables unless everything is loading. This better aligns behaviour of waitForAny() and waitForNone()
+
+## 0.1.2 (2020-10-30)
+
+- Fix TypeScript exports
+
+## 0.1.1 (2020-10-29)
+
+- Performance Improvements
+- Experimental React Native support
+- Experimental Atom Effects
+- Experimental Snapshot construction
+
+## 0.0.13 (2020-09-16)
+
+- Fix for bug affecting SSR
+
+## 0.0.12 (2020-09-15)
+
+- Fix for bug affecting SSR on development builds
+
+## 0.0.11 (2020-09-15)
+
+- Experimental React Concurrent Mode Support
+- Performance
+- Flow Types
+- ES, CommonJS, and UMD packages
+- Synchronization Across React Roots
+- Preliminary Developer Tools API
+- Test Infrastructure Fixes
+
+## 0.0.10 (2020-06-18)
+
+### Bug Fix
+
+- Fix exports for snapshot hooks
+
+## 0.0.9 (2020-06-17)
+
+### Features
+
+- TypeScript support now rolled into Recoil repository and package.
+- Recoil Snapshot API for observing and managing global Recoil state.
+
+### Improvements
+
+- Throw error with meaningful message if user doesn't use an atom or selector with most Recoil hooks (#205) - Thanks @alexandrzavalii
+- Improve testing (#321, #318, #294, #262, #295) - Thanks @aaronabramov, @Komalov, @mondaychen, @drarmstr, and @tyler-mitchell
+- Improve open-source build (#249, #203, #33) - Thanks to @tony-go, @acutmore, and @jaredpalmer
+
+### Bug Fixes
+
+- Some fixes for Server Side Rendering, though we do not officially support it yet. (#233, #220, #284) - Thanks @fyber-LJX, @Chrischuck, and @aulneau
+- Fix selectors recording dependency subscriptions in some cases (#296) - Thanks @drarmstr
+- Fix updaters in `useRecoilCallback()` getting current state (#260) - Thanks @drarmstr
+- Fix error messages when throwing certain errors in the open-source build. (#199) - Thanks @jonthomp
+- Reduce Flow errors for open-source builds (#308) - Thanks @Komalov
+
 ## 0.0.8 (2020-05-30)
 
 ### Bug Fixes

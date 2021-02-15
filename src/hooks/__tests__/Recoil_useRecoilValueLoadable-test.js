@@ -10,24 +10,32 @@
  */
 'use strict';
 
-const React = require('React');
-const {act} = require('ReactTestUtils');
-const constSelector = require('../../recoil_values/Recoil_const');
-const errorSelector = require('../../recoil_values/Recoil_error');
-const {useRecoilValueLoadable} = require('../Recoil_Hooks');
-const {
+const {getRecoilTestFn} = require('../../testing/Recoil_TestingUtils');
+
+let React,
+  act,
+  constSelector,
+  errorSelector,
   asyncSelector,
   renderElements,
-} = require('../../testing/Recoil_TestingUtils');
+  useRecoilValueLoadable;
 
-const gkx = require('../../util/Recoil_gkx');
-
-gkx.setPass('recoil_async_selector_refactor');
+const testRecoil = getRecoilTestFn(() => {
+  React = require('React');
+  ({act} = require('ReactTestUtils'));
+  constSelector = require('../../recoil_values/Recoil_constSelector');
+  errorSelector = require('../../recoil_values/Recoil_errorSelector');
+  ({
+    asyncSelector,
+    renderElements,
+  } = require('../../testing/Recoil_TestingUtils'));
+  ({useRecoilValueLoadable} = require('../Recoil_Hooks'));
+});
 
 // These tests should cover the Loadable interface returned by useRecoilValueLoadable.
 // It is also used by useRecoilStateNoThrow, waitForNone, and waitForAny
 
-test('useRecoilValueLoadable - loadable with value', async () => {
+testRecoil('useRecoilValueLoadable - loadable with value', async () => {
   const valueSel = constSelector('VALUE');
   let promise;
   function ReadLoadable() {
@@ -35,6 +43,7 @@ test('useRecoilValueLoadable - loadable with value', async () => {
     expect(loadable.state).toBe('hasValue');
     expect(loadable.contents).toBe('VALUE');
     expect(loadable.getValue()).toBe('VALUE');
+    // eslint-disable-next-line jest/valid-expect
     promise = expect(loadable.toPromise()).resolves.toBe('VALUE');
     expect(loadable.valueMaybe()).toBe('VALUE');
     expect(loadable.valueOrThrow()).toBe('VALUE');
@@ -49,7 +58,7 @@ test('useRecoilValueLoadable - loadable with value', async () => {
   await promise;
 });
 
-test('useRecoilValueLoadable - loadable with error', async () => {
+testRecoil('useRecoilValueLoadable - loadable with error', async () => {
   const valueSel = errorSelector('ERROR');
   let promise;
   function ReadLoadable() {
@@ -57,12 +66,13 @@ test('useRecoilValueLoadable - loadable with error', async () => {
     expect(loadable.state).toBe('hasError');
     expect(loadable.contents).toBeInstanceOf(Error);
     expect(() => loadable.getValue()).toThrow('ERROR');
+    // eslint-disable-next-line jest/valid-expect
     promise = expect(loadable.toPromise()).rejects.toBeInstanceOf(Error);
     expect(loadable.valueMaybe()).toBe(undefined);
     expect(() => loadable.valueOrThrow()).toThrow(Error);
-    expect((loadable.errorMaybe() ?? {}).toString()).toContain('ERROR');
+    expect(String(loadable.errorMaybe() ?? {})).toContain('ERROR');
     expect(loadable.errorOrThrow()).toBeInstanceOf(Error);
-    expect(loadable.errorOrThrow().toString()).toContain('ERROR');
+    expect(String(loadable.errorOrThrow())).toContain('ERROR');
     expect(loadable.promiseMaybe()).toBe(undefined);
     expect(() => loadable.promiseOrThrow()).toThrow(Error);
     return 'VALUE';
@@ -72,7 +82,7 @@ test('useRecoilValueLoadable - loadable with error', async () => {
   await promise;
 });
 
-test('useRecoilValueLoadable - loading loadable', async () => {
+testRecoil('useRecoilValueLoadable - loading loadable', async () => {
   const [valueSel, resolve] = asyncSelector();
   let resolved = false;
   const promises = [];
@@ -92,10 +102,8 @@ test('useRecoilValueLoadable - loading loadable', async () => {
       expect(() => loadable.valueOrThrow()).toThrow(Error);
       expect(loadable.errorMaybe()).toBe(undefined);
       expect(() => loadable.errorOrThrow()).toThrow(Error);
-      expect(loadable.promiseMaybe() === loadable.promiseOrThrow()).toBe(true);
       expect(loadable.promiseMaybe()).toBeInstanceOf(Promise);
       promises.push(loadable.promiseMaybe());
-      expect(loadable.promiseMaybe()).resolves.toBe('VALUE');
       return 'LOADING';
     } else {
       expect(loadable.state).toBe('hasValue');
@@ -125,7 +133,7 @@ test('useRecoilValueLoadable - loading loadable', async () => {
       }
 
       const res = await promise;
-      const val = typeof res === 'string' ? res : res.value;
+      const val = typeof res === 'string' ? res : res.__value;
 
       expect(val).toBe('VALUE');
     }),

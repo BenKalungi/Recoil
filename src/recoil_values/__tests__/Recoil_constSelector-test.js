@@ -10,43 +10,51 @@
  */
 'use strict';
 
-const constSelector = require('../Recoil_const');
-const {getRecoilValueAsLoadable} = require('../../core/Recoil_RecoilValue');
-const {makeStore} = require('../../testing/Recoil_TestingUtils');
+import type {RecoilValue} from '../../core/Recoil_RecoilValue';
 
-let store;
-beforeEach(() => {
+const {getRecoilTestFn} = require('../../testing/Recoil_TestingUtils');
+
+let getRecoilValueAsLoadable, store, constSelector;
+
+const testRecoil = getRecoilTestFn(() => {
+  const {makeStore} = require('../../testing/Recoil_TestingUtils');
+
+  ({
+    getRecoilValueAsLoadable,
+  } = require('../../core/Recoil_RecoilValueInterface'));
+  constSelector = require('../Recoil_constSelector');
+
   store = makeStore();
 });
 
-function get(recoilValue) {
-  return getRecoilValueAsLoadable(store, recoilValue).contents;
+function get<T>(recoilValue: RecoilValue<T>): T {
+  return getRecoilValueAsLoadable<T>(store, recoilValue).valueOrThrow();
 }
 
-test('constSelector - string', () => {
+testRecoil('constSelector - string', () => {
   const mySelector = constSelector('HELLO');
   expect(get(mySelector)).toEqual('HELLO');
   expect(get(mySelector)).toBe('HELLO');
 });
 
-test('constSelector - number', () => {
+testRecoil('constSelector - number', () => {
   const mySelector = constSelector(42);
   expect(get(mySelector)).toEqual(42);
   expect(get(mySelector)).toBe(42);
 });
 
-test('constSelector - null', () => {
+testRecoil('constSelector - null', () => {
   const mySelector = constSelector(null);
   expect(get(mySelector)).toEqual(null);
   expect(get(mySelector)).toBe(null);
 });
 
-test('constSelector - boolean', () => {
+testRecoil('constSelector - boolean', () => {
   const mySelector = constSelector(true);
   expect(get(mySelector)).toEqual(true);
   expect(get(mySelector)).toBe(true);
 });
-test('constSelector - array', () => {
+testRecoil('constSelector - array', () => {
   const emptyArraySelector = constSelector([]);
   expect(get(emptyArraySelector)).toEqual([]);
 
@@ -56,7 +64,7 @@ test('constSelector - array', () => {
   expect(get(numberArraySelector)).toBe(numberArray);
 });
 
-test('constSelector - object', () => {
+testRecoil('constSelector - object', () => {
   const emptyObjSelector = constSelector({});
   expect(get(emptyObjSelector)).toEqual({});
 
@@ -77,4 +85,17 @@ test('constSelector - object', () => {
   const objSelector3 = constSelector(newObj);
   expect(get(objSelector3)).toEqual({foo: 'bar'});
   expect(get(objSelector3)).toBe(newObj);
+});
+
+testRecoil('constSelector - function', () => {
+  const foo = () => 'FOO';
+  const bar = () => 'BAR';
+
+  const fooSelector = constSelector(foo);
+  const barSelector = constSelector(bar);
+
+  expect(get(fooSelector)()).toEqual('FOO');
+  expect(get(barSelector)()).toEqual('BAR');
+
+  expect(constSelector(foo)).toEqual(fooSelector);
 });
